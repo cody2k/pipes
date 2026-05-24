@@ -1,0 +1,26 @@
+# dbt artifacts & unnecessary folders
+target/
+dbt_packages/
+logs/
+base_queries/
+docs/
+.claude/
+*.htm
+*.html
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.example
+.env*
+*.json
+!package.json
+profiles.yml
+!ci/profiles.yml
+load_env.ps1
+.DS_Store
+*.md
+!README.md
+Thumbs.db
