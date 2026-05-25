@@ -24,3 +24,4 @@ load_env.ps1
 *.md
 !README.md
 Thumbs.db
+*tmp*

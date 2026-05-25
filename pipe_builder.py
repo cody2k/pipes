@@ -21,6 +21,7 @@ Built-in examples (run as __main__):
 """
 
 from __future__ import annotations
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -225,50 +226,36 @@ def save_vertices_csv(rings: List[np.ndarray],
                       frames: List[Tuple[np.ndarray, np.ndarray]],
                       filename: str) -> None:
     """
-    Save vertices CSV matching example_vertices.csv.
+    Save vertices CSV — one entry per point (vertex_index == point_index).
 
-    Columns: index, prim:vindex, pindex, N(0..2), Tex(0..2)
+    Columns: index, pindex, N(0..2), Tex(0..2)
 
     Normals are outward radial in the cross-section plane:
         N = cos(j * π/3) * u  +  sin(j * π/3) * v
     UVs wrap the hex circumference (Tex0) and pipe length (Tex1).
     """
     n_rings = len(rings)
-    n_ring_gaps = n_rings - 1
+    n_gaps = max(n_rings - 1, 1)
     angles = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
     rows = []
-    row_idx = 0
-    for i in range(n_ring_gaps):
+    for k, (ring, frame) in enumerate(zip(rings, frames)):
+        u, bv = frame
+        tex_v = k / n_gaps
         for j in range(6):
-            j2 = (j + 1) % 6
-            face_idx = i * 6 + j
-            # 4 corners: (ring i, vtx j), (ring i, vtx j2),
-            #            (ring i+1, vtx j2), (ring i+1, vtx j)
-            # Tex(0) uses j+1 (not j2) so the last face wraps to 1.0 not 0.0
-            for local, ring_k, vtx_k, tex_u in (
-                (0, i,     j,  j / 6),
-                (1, i,     j2, (j + 1) / 6),
-                (2, i + 1, j2, (j + 1) / 6),
-                (3, i + 1, j,  j / 6),
-            ):
-                u, v = frames[ring_k]
-                a = angles[vtx_k]
-                normal = np.cos(a) * u + np.sin(a) * v
-                tex_v = ring_k / n_ring_gaps
-                rows.append({
-                    'index':      row_idx,
-                    'prim:vindex': f"{face_idx}:{local}",
-                    'pindex':     ring_k * 6 + vtx_k,
-                    'N(0)':       normal[0],
-                    'N(1)':       normal[1],
-                    'N(2)':       normal[2],
-                    'Tex(0)':     tex_u,
-                    'Tex(1)':     tex_v,
-                    'Tex(2)':     0.0,
-                })
-                row_idx += 1
+            a = angles[j]
+            normal = np.cos(a) * u + np.sin(a) * bv
+            rows.append({
+                'index':  k * 6 + j,
+                'pindex': k * 6 + j,
+                'N(0)':   float(normal[0]),
+                'N(1)':   float(normal[1]),
+                'N(2)':   float(normal[2]),
+                'Tex(0)': j / 6,
+                'Tex(1)': tex_v,
+                'Tex(2)': 0.0,
+            })
     pd.DataFrame(rows).to_csv(filename, index=False)
-    print(f"  Saved {row_idx} vertex entries -> {filename}")
+    print(f"  Saved {len(rows)} vertex entries -> {filename}")
 
 
 def save_pipe_td(rings: List[np.ndarray],
@@ -287,22 +274,594 @@ def save_pipe_td(rings: List[np.ndarray],
     save_primitives_csv(rings,          basename + '_primitives.csv')
 
 
+# ── Internal geometry row builders ───────────────────────────────────────────
+
+def _rotation_z_to(target: np.ndarray) -> np.ndarray:
+    """Rotation matrix R such that R @ [0,0,1] == target (normalised)."""
+    target = target / np.linalg.norm(target)
+    z = np.array([0.0, 0.0, 1.0])
+    cross = np.cross(z, target)
+    s = float(np.linalg.norm(cross))
+    if s < 1e-10:
+        return np.eye(3) if float(np.dot(z, target)) > 0 else np.diag([1.0, -1.0, -1.0])
+    axis = cross / s
+    c = float(np.clip(np.dot(z, target), -1.0, 1.0))
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]])
+    return np.eye(3) + s * K + (1 - c) * (K @ K)
+
+
+def _pipe_to_rows(rings: List[np.ndarray],
+                  frames: List[Tuple[np.ndarray, np.ndarray]],
+                  point_offset: int = 0,
+                  prim_offset:  int = 0,
+                  vert_offset:  int = 0,
+                  ) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    Points / primitives / vertices row-lists for one pipe with global offsets.
+
+    Vertex model: one entry per point (vertex_index == point_index).
+    Adjacent faces sharing an edge share the same vertex indices, giving TD
+    explicit connectivity information.
+    """
+    n_rings = len(rings)
+    n_gaps  = max(n_rings - 1, 1)
+    angles  = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
+
+    pts_rows:   List[dict] = []
+    verts_rows: List[dict] = []
+    for k, (ring, frame) in enumerate(zip(rings, frames)):
+        u, bv = frame
+        tex_v = k / n_gaps
+        for j in range(6):
+            a      = angles[j]
+            normal = np.cos(a) * u + np.sin(a) * bv
+            pts_rows.append({
+                'index': point_offset + k * 6 + j,
+                'P(0)':  float(ring[j][0]),
+                'P(1)':  float(ring[j][1]),
+                'P(2)':  float(ring[j][2]),
+            })
+            verts_rows.append({
+                'index':  vert_offset + k * 6 + j,
+                'pindex': point_offset + k * 6 + j,
+                'N(0)':   float(normal[0]),
+                'N(1)':   float(normal[1]),
+                'N(2)':   float(normal[2]),
+                'Tex(0)': j / 6,
+                'Tex(1)': tex_v,
+                'Tex(2)': 0.0,
+            })
+
+    prims_rows: List[dict] = []
+    for i in range(n_rings - 1):
+        for j in range(6):
+            j2       = (j + 1) % 6
+            face_idx = prim_offset + i * 6 + j
+            v0 = point_offset + i * 6 + j
+            v1 = point_offset + i * 6 + j2
+            v2 = point_offset + (i + 1) * 6 + j2
+            v3 = point_offset + (i + 1) * 6 + j
+            prims_rows.append({'index': face_idx, 'type': 'quad',
+                               'vertices': f"{v0} {v1} {v2} {v3}"})
+
+    return pts_rows, prims_rows, verts_rows
+
+
+def _sphere_to_rows(pipe_end:     np.ndarray,
+                    radius:       float,
+                    tangent:      np.ndarray,
+                    n_lat:        int = 24,
+                    n_lon:        int = 36,
+                    point_offset: int = 0,
+                    prim_offset:  int = 0,
+                    vert_offset:  int = 0,
+                    ) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    Points / primitives / vertices row-lists for a UV sphere.
+
+    The sphere is positioned so its south pole sits flush at *pipe_end*;
+    the north pole extends outward along *tangent*.  Sphere centre lands at
+    pipe_end + radius * tangent_normalised.
+    """
+    t = np.asarray(tangent, float)
+    t /= np.linalg.norm(t)
+    center = np.asarray(pipe_end, float) + radius * t
+    R = _rotation_z_to(t)   # local +Z → world tangent; local −Z → pipe end
+
+    n_mid      = n_lat - 1  # middle latitude rings (excluding poles)
+    lat_angles = np.linspace(0.0, np.pi, n_lat + 1)[1:-1]   # n_mid values
+    lon_angles = np.linspace(0.0, 2.0 * np.pi, n_lon, endpoint=False)
+
+    # ── Vertex positions ──────────────────────────────────────────────────
+    pts_local: List[np.ndarray] = [np.array([0.0, 0.0, radius])]   # north pole
+    for la in lat_angles:
+        for lo in lon_angles:
+            pts_local.append(np.array([
+                radius * np.sin(la) * np.cos(lo),
+                radius * np.sin(la) * np.sin(lo),
+                radius * np.cos(la),
+            ]))
+    pts_local.append(np.array([0.0, 0.0, -radius]))                # south pole
+
+    south_idx = len(pts_local) - 1
+    pts_world = [center + R @ p for p in pts_local]
+
+    # Per-point rows (vertex_index == point_index)
+    pts_rows:   List[dict] = []
+    verts_rows: List[dict] = []
+    for i, (pl, pw) in enumerate(zip(pts_local, pts_world)):
+        pts_rows.append({
+            'index': point_offset + i,
+            'P(0)':  float(pw[0]), 'P(1)': float(pw[1]), 'P(2)': float(pw[2]),
+        })
+        normal = (np.asarray(pw) - center) / radius
+        if i == 0:
+            tu, tv = 0.5, 0.0
+        elif i == south_idx:
+            tu, tv = 0.5, 1.0
+        else:
+            ring_i = (i - 1) // n_lon
+            lon_j  = (i - 1) % n_lon
+            tu = lon_j / n_lon
+            tv = (ring_i + 1) / n_lat
+        verts_rows.append({
+            'index':  vert_offset + i,
+            'pindex': point_offset + i,
+            'N(0)':   float(normal[0]), 'N(1)': float(normal[1]),
+            'N(2)':   float(normal[2]),
+            'Tex(0)': tu, 'Tex(1)': tv, 'Tex(2)': 0.0,
+        })
+
+    prims_rows: List[dict] = []
+    p_idx = prim_offset
+
+    # North cap triangles (pole -> first ring)
+    for j in range(n_lon):
+        j2      = (j + 1) % n_lon
+        a0, a1, a2 = 0, 1 + j, 1 + j2
+        prims_rows.append({'index': p_idx, 'type': 'tri',
+                           'vertices': f"{point_offset+a0} {point_offset+a1} "
+                                       f"{point_offset+a2}"})
+        p_idx += 1
+
+    # Middle quads
+    for i in range(n_mid - 1):
+        ring_s = 1 + i * n_lon
+        next_s = ring_s + n_lon
+        for j in range(n_lon):
+            j2      = (j + 1) % n_lon
+            a0, a1  = ring_s + j,  ring_s + j2
+            a2, a3  = next_s + j2, next_s + j
+            prims_rows.append({'index': p_idx, 'type': 'quad',
+                               'vertices': f"{point_offset+a0} {point_offset+a1} "
+                                           f"{point_offset+a2} {point_offset+a3}"})
+            p_idx += 1
+
+    # South cap triangles (last ring -> south pole)
+    last_ring_s = 1 + (n_mid - 1) * n_lon
+    for j in range(n_lon):
+        j2      = (j + 1) % n_lon
+        a0, a1  = last_ring_s + j, last_ring_s + j2
+        prims_rows.append({'index': p_idx, 'type': 'tri',
+                           'vertices': f"{point_offset+a0} {point_offset+a1} "
+                                       f"{point_offset+south_idx}"})
+        p_idx += 1
+
+    return pts_rows, prims_rows, verts_rows
+
+
+# ── Combined multi-pipe / reservoir export ────────────────────────────────────
+
+def save_combined_td(pipes_data: List[Tuple[List[np.ndarray],
+                                            List[Tuple[np.ndarray, np.ndarray]]]],
+                     basename:         str,
+                     reservoir_radius: float | None = None,
+                     reservoir_n_lat:  int           = 24,
+                     reservoir_n_lon:  int           = 36) -> None:
+    """
+    Save joined TouchDesigner POP CSVs for one or more pipe segments,
+    with an optional spherical reservoir attached to the final pipe end.
+
+    Parameters
+    ----------
+    pipes_data       : list of (rings, frames) tuples — one per pipe segment
+    basename         : output path prefix (e.g. 'output/my_network')
+    reservoir_radius : if given, append a sphere of this radius to the last
+                       pipe's end; set to None to omit the reservoir
+    reservoir_n_lat  : latitude bands on the sphere — higher = smoother (default 24)
+    reservoir_n_lon  : longitude slices on the sphere — higher = smoother (default 36)
+
+    Writes
+    ------
+    {basename}_points.csv
+    {basename}_primitives.csv
+    {basename}_vertices.csv
+    """
+    all_pts:   List[dict] = []
+    all_prims: List[dict] = []
+    all_verts: List[dict] = []
+    pt_off = pr_off = vt_off = 0
+
+    for rings, frames in pipes_data:
+        pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
+        all_pts.extend(pts)
+        all_prims.extend(prims)
+        all_verts.extend(verts)
+        pt_off += len(rings) * 6
+        pr_off += (len(rings) - 1) * 6
+        vt_off += len(verts)
+
+    if reservoir_radius is not None:
+        last_rings = pipes_data[-1][0]
+        pipe_end   = last_rings[-1].mean(axis=0)
+        if len(last_rings) >= 2:
+            t_end = last_rings[-1].mean(0) - last_rings[-2].mean(0)
+        else:
+            t_end = np.array([0.0, 0.0, 1.0])
+        t_end = t_end / np.linalg.norm(t_end)
+
+        pts, prims, verts = _sphere_to_rows(
+            pipe_end, reservoir_radius, t_end,
+            reservoir_n_lat, reservoir_n_lon,
+            pt_off, pr_off, vt_off,
+        )
+        all_pts.extend(pts)
+        all_prims.extend(prims)
+        all_verts.extend(verts)
+
+    pd.DataFrame(all_pts).to_csv(  basename + '_points.csv',     index=False)
+    pd.DataFrame(all_prims).to_csv(basename + '_primitives.csv', index=False)
+    pd.DataFrame(all_verts).to_csv(basename + '_vertices.csv',   index=False)
+    n_segs = len(pipes_data)
+    suffix = " + reservoir" if reservoir_radius is not None else ""
+    print(f"  {n_segs} pipe(s){suffix}: {len(all_pts)} pts / "
+          f"{len(all_prims)} prims / {len(all_verts)} verts -> {basename}_*.csv")
+
+
+# ── Pipe series — smooth connected joints ─────────────────────────────────────
+
+def generate_pipe_series(
+        segment_waypoints: List[List],
+        radius:            float = 0.25,
+        rings_per_length:  float = 15.0,
+        tension:           float = 0.5,
+) -> List[Tuple[List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]]]]:
+    """
+    Generate a series of smoothly joined pipe segments from a single spline.
+
+    Adjacent segment lists must share their boundary waypoint:
+        [[A, B], [B, C, D], [D, E]]
+
+    One Catmull-Rom spline is generated through all waypoints so tangents are
+    continuous at every junction.  Rings are then partitioned at the ring
+    nearest each boundary waypoint; that ring is included in both adjacent
+    segments so save_series_td can reference it without duplication.
+
+    Parameters
+    ----------
+    segment_waypoints : list of waypoint lists, adjacent lists share boundary
+    radius            : hex circumradius (default 0.25)
+    rings_per_length  : rings per world-unit of arc length (default 15)
+    tension           : 0.0 = smooth Catmull-Rom, 1.0 = linear (default 0.5)
+
+    Returns
+    -------
+    list of (rings, frames) — one tuple per segment
+    """
+    # Flatten to one waypoint list, record junction points
+    all_wps: List[np.ndarray] = [np.array(p, float) for p in segment_waypoints[0]]
+    junction_wps: List[np.ndarray] = []
+    for seg in segment_waypoints[1:]:
+        junction_wps.append(np.array(seg[0], float))
+        all_wps.extend(np.array(p, float) for p in seg[1:])
+
+    seg_lens  = [float(np.linalg.norm(all_wps[i + 1] - all_wps[i]))
+                 for i in range(len(all_wps) - 1)]
+    total_len = sum(seg_lens)
+    n_rings   = max(20, int(total_len * rings_per_length))
+
+    rings, frames = generate_pipe(all_wps, radius, n_rings, tension,
+                                  return_frames=True)
+
+    # For each junction waypoint find the nearest ring center
+    centers = np.array([r.mean(0) for r in rings])
+    split_indices = [0]
+    for junc in junction_wps:
+        idx = int(np.argmin(np.linalg.norm(centers - junc, axis=1)))
+        split_indices.append(idx)
+    split_indices.append(len(rings) - 1)
+
+    return [(rings[split_indices[i]:split_indices[i + 1] + 1],
+             frames[split_indices[i]:split_indices[i + 1] + 1])
+            for i in range(len(segment_waypoints))]
+
+
+def _sphere_hole_to_rows(
+        pipe_end:      np.ndarray,
+        pipe_radius:   float,
+        pipe_frame:    Tuple[np.ndarray, np.ndarray],
+        t_end:         np.ndarray,
+        sphere_radius: float,
+        n_lat:         int   = 20,
+        inset:         float = 0.0125,
+        point_offset:  int   = 0,
+        prim_offset:   int   = 0,
+        vert_offset:   int   = 0,
+) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    Points / primitives / vertices for a spherical reservoir with a hex hole.
+
+    The sphere uses n_lon=6 longitude slices aligned with the pipe's own hex
+    frame so the opening exactly matches the pipe cross-section.  The rim sits
+    *inset* units inside the pipe end (default 0.0125).  No south-cap faces
+    are generated — the hexagonal boundary is the open mouth of the reservoir.
+
+    Geometry
+    --------
+    sphere centre  = pipe_end + (d - inset) * t_end
+    d              = sqrt(sphere_radius^2 - pipe_radius^2)
+    theta_rim      = arccos(-d / sphere_radius)   [co-latitude of hex rim]
+    """
+    t = np.asarray(t_end, float)
+    t /= np.linalg.norm(t)
+    u, v = pipe_frame
+
+    if sphere_radius <= pipe_radius:
+        raise ValueError("sphere_radius must exceed pipe_radius")
+
+    d             = float(np.sqrt(sphere_radius ** 2 - pipe_radius ** 2))
+    sphere_center = np.asarray(pipe_end, float) + (d - inset) * t
+    theta_rim     = float(np.arccos(-d / sphere_radius))   # ∈ (π/2, π)
+
+    # Latitude grid from just past north pole down to rim (n_lat rings)
+    lat_angles = np.linspace(0.0, theta_rim, n_lat + 1)[1:]   # last = theta_rim
+    lon_angles = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
+
+    # Vertex positions: north pole + n_lat rings of 6
+    north_pole = sphere_center + sphere_radius * t
+    pts_world: List[np.ndarray] = [north_pole]
+    for la in lat_angles:
+        r_lat = sphere_radius * np.sin(la)
+        z_lat = sphere_radius * np.cos(la)
+        for lo in lon_angles:
+            pts_world.append(
+                sphere_center + z_lat * t + r_lat * (np.cos(lo) * u + np.sin(lo) * v)
+            )
+
+    # Per-point rows (vertex_index == point_index)
+    pts_rows:   List[dict] = []
+    verts_rows: List[dict] = []
+    for i, pw in enumerate(pts_world):
+        pts_rows.append({
+            'index': point_offset + i,
+            'P(0)':  float(pw[0]), 'P(1)': float(pw[1]), 'P(2)': float(pw[2]),
+        })
+        normal = (np.asarray(pw) - sphere_center) / sphere_radius
+        if i == 0:
+            tu, tv = 0.5, 0.0
+        else:
+            ring_i = (i - 1) // 6
+            lon_j  = (i - 1) % 6
+            tu = lon_j / 6
+            tv = lat_angles[ring_i] / theta_rim
+        verts_rows.append({
+            'index':  vert_offset + i,
+            'pindex': point_offset + i,
+            'N(0)':   float(normal[0]), 'N(1)': float(normal[1]),
+            'N(2)':   float(normal[2]),
+            'Tex(0)': tu, 'Tex(1)': tv, 'Tex(2)': 0.0,
+        })
+
+    prims_rows: List[dict] = []
+    p_idx = prim_offset
+
+    # North cap: 6 triangles
+    for k in range(6):
+        k2 = (k + 1) % 6
+        prims_rows.append({'index': p_idx, 'type': 'tri',
+                           'vertices': f"{point_offset} "
+                                       f"{point_offset+1+k} {point_offset+1+k2}"})
+        p_idx += 1
+
+    # Middle quads: (n_lat - 1) bands
+    for i in range(n_lat - 1):
+        rs = 1 + i * 6
+        ns = rs + 6
+        for k in range(6):
+            k2      = (k + 1) % 6
+            a0, a1  = rs + k,  rs + k2
+            a2, a3  = ns + k2, ns + k
+            prims_rows.append({'index': p_idx, 'type': 'quad',
+                               'vertices': f"{point_offset+a0} {point_offset+a1} "
+                                           f"{point_offset+a2} {point_offset+a3}"})
+            p_idx += 1
+
+    # No south-cap faces — hex rim is the open boundary
+    return pts_rows, prims_rows, verts_rows
+
+
+def save_series_td(
+        segments:         List[Tuple[List[np.ndarray],
+                                     List[Tuple[np.ndarray, np.ndarray]]]],
+        basename:         str,
+        reservoir_radius: float | None = None,
+        reservoir_n_lat:  int           = 20,
+        reservoir_inset:  float         = 0.0125,
+) -> None:
+    """
+    Save joined TD POP CSVs for a pipe series from generate_pipe_series().
+
+    Junction rings shared between adjacent segments are exported once only,
+    eliminating duplicate vertices and any positional gap at every joint.
+
+    Parameters
+    ----------
+    segments         : list of (rings, frames) from generate_pipe_series()
+    basename         : output path prefix (e.g. 'output/my_series')
+    reservoir_radius : if given, attach a hex-hole sphere of this radius at the end
+    reservoir_n_lat  : latitude bands on the hex-hole sphere — higher = smoother
+                       (default 20; n_lon is always 6 to match the hex pipe opening)
+    reservoir_inset  : how far the sphere overlaps into the pipe (default 0.0125)
+    """
+    all_pts:   List[dict] = []
+    all_prims: List[dict] = []
+    all_verts: List[dict] = []
+    pt_off = pr_off = vt_off = 0
+
+    for seg_idx, (rings, frames) in enumerate(segments):
+        if seg_idx == 0:
+            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
+            all_pts.extend(pts)
+            all_verts.extend(verts)
+            pt_off += len(rings) * 6          # all rings are new
+            vt_off += len(rings) * 6
+        else:
+            # Junction ring == last ring of previous segment; reuse its indices
+            pt_off -= 6
+            vt_off -= 6
+            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
+            all_pts.extend(pts[6:])            # skip first ring (already exported)
+            all_verts.extend(verts[6:])        # skip first ring's vertices (same)
+            pt_off += len(rings) * 6           # net advance: (n-1)*6
+            vt_off += len(rings) * 6
+
+        all_prims.extend(prims)
+        pr_off += (len(rings) - 1) * 6
+
+    if reservoir_radius is not None:
+        last_rings, last_frames = segments[-1]
+        pipe_end    = last_rings[-1].mean(axis=0)
+        pipe_radius = float(np.linalg.norm(last_rings[-1][0] - pipe_end))
+        t_end = last_rings[-1].mean(0) - last_rings[-2].mean(0)
+        t_end /= np.linalg.norm(t_end)
+
+        pts, prims, verts = _sphere_hole_to_rows(
+            pipe_end, pipe_radius, last_frames[-1], t_end,
+            reservoir_radius, reservoir_n_lat, reservoir_inset,
+            pt_off, pr_off, vt_off,
+        )
+        all_pts.extend(pts)
+        all_prims.extend(prims)
+        all_verts.extend(verts)
+
+    pd.DataFrame(all_pts).to_csv(  basename + '_points.csv',     index=False)
+    pd.DataFrame(all_prims).to_csv(basename + '_primitives.csv', index=False)
+    pd.DataFrame(all_verts).to_csv(basename + '_vertices.csv',   index=False)
+    suffix = " + reservoir" if reservoir_radius is not None else ""
+    print(f"  {len(segments)} seg(s){suffix}: {len(all_pts)} pts / "
+          f"{len(all_prims)} prims / {len(all_verts)} verts -> {basename}_*.csv")
+
+
 # ── Visualisation ─────────────────────────────────────────────────────────────
 
 _PALETTE = ['#1565C0', '#C62828', '#2E7D32', '#E65100', '#6A1B9A', '#00838F']
 
 
-def visualize_pipes(pipes: Dict[str, List[np.ndarray]],
-                    title:     str = "Hexagonal Pipes",
-                    save_path: str | None = None):
+def _sphere_polys(pipe_end:  np.ndarray,
+                  radius:    float,
+                  tangent:   np.ndarray,
+                  n_lat:     int = 12,
+                  n_lon:     int = 18) -> List[np.ndarray]:
+    """Return polygon vertex arrays (for Poly3DCollection) for a reservoir sphere."""
+    t = np.asarray(tangent, float)
+    t /= np.linalg.norm(t)
+    center = np.asarray(pipe_end, float) + radius * t
+    R = _rotation_z_to(t)
+
+    n_mid      = n_lat - 1
+    lat_angles = np.linspace(0.0, np.pi, n_lat + 1)[1:-1]
+    lon_angles = np.linspace(0.0, 2.0 * np.pi, n_lon, endpoint=False)
+
+    pts_local: List[np.ndarray] = [np.array([0.0, 0.0, radius])]
+    for la in lat_angles:
+        for lo in lon_angles:
+            pts_local.append(np.array([
+                radius * np.sin(la) * np.cos(lo),
+                radius * np.sin(la) * np.sin(lo),
+                radius * np.cos(la),
+            ]))
+    pts_local.append(np.array([0.0, 0.0, -radius]))
+
+    pts = np.array([center + R @ p for p in pts_local])
+    south_idx = len(pts) - 1
+    faces: List[np.ndarray] = []
+
+    for j in range(n_lon):
+        j2 = (j + 1) % n_lon
+        faces.append(pts[[0, 1 + j, 1 + j2]])
+
+    for i in range(n_mid - 1):
+        rs, ns = 1 + i * n_lon, 1 + (i + 1) * n_lon
+        for j in range(n_lon):
+            j2 = (j + 1) % n_lon
+            faces.append(pts[[rs + j, rs + j2, ns + j2, ns + j]])
+
+    last_s = 1 + (n_mid - 1) * n_lon
+    for j in range(n_lon):
+        j2 = (j + 1) % n_lon
+        faces.append(pts[[last_s + j, last_s + j2, south_idx]])
+
+    return faces
+
+
+def _sphere_hole_polys(
+        pipe_end:      np.ndarray,
+        pipe_radius:   float,
+        pipe_frame:    Tuple[np.ndarray, np.ndarray],
+        t_end:         np.ndarray,
+        sphere_radius: float,
+        n_lat:         int   = 10,
+        inset:         float = 0.0125,
+) -> List[np.ndarray]:
+    """Polygon vertex arrays (for Poly3DCollection) for a hex-hole reservoir sphere."""
+    t = np.asarray(t_end, float);  t /= np.linalg.norm(t)
+    u, bv = pipe_frame
+    d             = float(np.sqrt(sphere_radius ** 2 - pipe_radius ** 2))
+    sphere_center = np.asarray(pipe_end, float) + (d - inset) * t
+    theta_rim     = float(np.arccos(-d / sphere_radius))
+    lat_angles    = np.linspace(0.0, theta_rim, n_lat + 1)[1:]
+    lon_angles    = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
+
+    north_pole = sphere_center + sphere_radius * t
+    pts = [north_pole]
+    for la in lat_angles:
+        r_lat, z_lat = sphere_radius * np.sin(la), sphere_radius * np.cos(la)
+        for lo in lon_angles:
+            pts.append(sphere_center + z_lat * t + r_lat * (np.cos(lo) * u + np.sin(lo) * bv))
+    pts = np.array(pts)
+
+    faces: List[np.ndarray] = []
+    for k in range(6):
+        k2 = (k + 1) % 6
+        faces.append(pts[[0, 1 + k, 1 + k2]])
+    for i in range(n_lat - 1):
+        rs, ns = 1 + i * 6, 1 + (i + 1) * 6
+        for k in range(6):
+            k2 = (k + 1) % 6
+            faces.append(pts[[rs + k, rs + k2, ns + k2, ns + k]])
+    return faces
+
+
+def visualize_pipes(
+        pipes:            Dict[str, List[np.ndarray]],
+        title:            str                           = "Hexagonal Pipes",
+        save_path:        str | None                    = None,
+        reservoirs:       List | None                   = None,
+        reservoir_holes:  List | None                   = None,
+):
     """
-    3-D visualisation of one or more hexagonal pipes.
+    3-D visualisation of hexagonal pipes with optional reservoirs.
 
     Parameters
     ----------
-    pipes     : mapping of label → rings list
-    title     : figure title
-    save_path : if given, saves PNG to this path before plt.show()
+    pipes           : mapping of label -> rings list
+    title           : figure title
+    save_path       : if given, saves PNG here before plt.show()
+    reservoirs      : list of (pipe_end, radius, tangent) — full UV spheres
+    reservoir_holes : list of (pipe_end, pipe_radius, pipe_frame, t_end,
+                      sphere_radius) — hex-hole reservoir spheres
     """
     fig = plt.figure(figsize=(16, 11))
     ax  = fig.add_subplot(111, projection='3d')
@@ -337,6 +896,37 @@ def visualize_pipes(pipes: Dict[str, List[np.ndarray]],
         ctrs = np.array([r.mean(0) for r in rings])
         ax.plot(ctrs[:, 0], ctrs[:, 1], ctrs[:, 2],
                 '--', color=color, lw=1.5, alpha=0.9, label=label)
+
+    # Full-sphere reservoirs
+    if reservoirs:
+        for k, (pe, rad, tang) in enumerate(reservoirs):
+            color = _PALETTE[(len(pipes) + k) % len(_PALETTE)]
+            faces = _sphere_polys(pe, rad, tang)
+            poly  = Poly3DCollection(faces, alpha=0.45, linewidth=0)
+            poly.set_facecolor(color)
+            ax.add_collection3d(poly)
+            t_n = np.asarray(tang, float) / np.linalg.norm(tang)
+            sc  = np.asarray(pe, float) + rad * t_n
+            all_verts.append(np.array([sc - rad, sc + rad]))
+            ax.scatter(*sc, color=color, s=40, alpha=0.9,
+                       label=f"Reservoir {k + 1}")
+
+    # Hex-hole reservoir spheres
+    if reservoir_holes:
+        offset = len(reservoirs) if reservoirs else 0
+        for k, args in enumerate(reservoir_holes):
+            color = _PALETTE[(len(pipes) + offset + k) % len(_PALETTE)]
+            pe, p_rad, p_frame, t_e, s_rad = args
+            faces = _sphere_hole_polys(pe, p_rad, p_frame, t_e, s_rad)
+            poly  = Poly3DCollection(faces, alpha=0.50, linewidth=0)
+            poly.set_facecolor(color)
+            ax.add_collection3d(poly)
+            t_n = np.asarray(t_e, float) / np.linalg.norm(t_e)
+            d   = float(np.sqrt(s_rad ** 2 - p_rad ** 2))
+            sc  = np.asarray(pe, float) + (d - 0.0125) * t_n
+            all_verts.append(np.array([sc - s_rad, sc + s_rad]))
+            ax.scatter(*sc, color=color, s=40, alpha=0.9,
+                       label=f"Reservoir {offset + k + 1}")
 
     # Equal-aspect bounding box
     all_pts = np.vstack(all_verts)
@@ -402,15 +992,64 @@ def example_spiral(return_frames: bool = False):
                          return_frames=return_frames)
 
 
+def example_joined(return_frames: bool = False):
+    """
+    Two connected pipe segments forming an L-then-straight run.
+
+    Segment 1: straight along +X from (0,0,0) to (2,0,0).
+    Segment 2: elbow from (2,0,0) up to (2,0,1.5) then along +X to (4,0,1.5).
+
+    Returns a list of (rings, frames) tuples — one per segment.
+    """
+    seg1 = generate_pipe([(0, 0, 0), (2, 0, 0)],
+                         radius=0.25, n_rings=15, tension=0.5,
+                         return_frames=True)
+    seg2 = generate_pipe([(2, 0, 0), (2, 0, 1.5), (4, 0, 1.5)],
+                         radius=0.25, n_rings=25, tension=0.4,
+                         return_frames=True)
+    if return_frames:
+        return [seg1, seg2]
+    return [seg1[0], seg2[0]]
+
+
+def example_pipe_series():
+    """
+    Three-segment vertical pipe series using a single Catmull-Rom spline.
+
+    Open end (inlet) at (-1, 2, -1); reservoir end at (-1, -1, 0).
+    X is constant throughout; Y descends while Z drifts gradually from -1 to 0.
+    Every junction is vertical-to-vertical (tangent dominantly along -Y):
+
+        Seg 1  (-1,  2.00, -1.00) -> (-1,  0.75, -1.00)   straight down
+        Seg 2  (-1,  0.75, -1.00) -> (-1, -0.25, -0.50)   curves toward Z=0
+        Seg 3  (-1, -0.25, -0.50) -> (-1, -1.00,  0.00)   arrives at reservoir
+
+    generate_pipe_series() produces a single spline so there are no kinks or
+    gaps at the junctions.  A hex-hole reservoir attaches at (-1, -1, 0).
+    """
+    return generate_pipe_series(
+        segment_waypoints=[
+            [(-1,  2.00, -1.00), (-1,  0.75, -1.00)],
+            [(-1,  0.75, -1.00), (-1, -0.25, -0.50)],
+            [(-1, -0.25, -0.50), (-1, -1.00,  0.00)],
+        ],
+        radius=0.25,
+        rings_per_length=20,
+        tension=0.5,
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    os.makedirs('output', exist_ok=True)
     print("Building pipes…")
 
+    # ── Individual examples (unchanged geometry) ──────────────────────────
     pipe_defs = [
-        ("Straight  (-1,0,0) → (1,0,0)",         example_straight, "pipe_straight"),
-        ("Elbow  (-1,0,0) → (1,0,0) → (1,0,2)", example_elbow,    "pipe_elbow"),
-        ("Spiral  (0,1,0) → (0,-5,0)",           example_spiral,   "pipe_spiral"),
+        ("Straight  (-1,0,0) → (1,0,0)",         example_straight, "output/pipe_straight"),
+        ("Elbow  (-1,0,0) → (1,0,0) → (1,0,2)", example_elbow,    "output/pipe_elbow"),
+        ("Spiral  (0,1,0) → (0,-5,0)",           example_spiral,   "output/pipe_spiral"),
     ]
 
     pipes: Dict[str, List[np.ndarray]] = {}
@@ -422,5 +1061,39 @@ if __name__ == "__main__":
 
     visualize_pipes(pipes,
                     title="Pipe Examples",
-                    save_path="pipes_visualization.png")
+                    save_path="output/pipes_visualization.png")
+
+    # ── Joined pipes (no reservoir) ───────────────────────────────────────
+    print("\n--- Joined pipes (legacy, separate splines) ---")
+    segs = example_joined(return_frames=True)
+    joined_rings = {f"Seg {i+1}": s[0] for i, s in enumerate(segs)}
+    save_combined_td(segs, "output/pipe_joined")
+
+    # ── Smooth pipe series + hex-hole reservoir ───────────────────────────
+    print("\n--- Smooth pipe series ---")
+    series = example_pipe_series()
+    series_rings = {f"Seg {i+1}": s[0] for i, s in enumerate(series)}
+
+    # Without reservoir
+    save_series_td(series, "output/pipe_series")
+
+    # With hex-hole reservoir
+    last_rings_s, last_frames_s = series[-1]
+    pipe_end_s    = last_rings_s[-1].mean(0)
+    pipe_radius_s = float(np.linalg.norm(last_rings_s[-1][0] - pipe_end_s))
+    t_end_s       = last_rings_s[-1].mean(0) - last_rings_s[-2].mean(0)
+    t_end_s      /= np.linalg.norm(t_end_s)
+    res_radius    = 0.5
+
+    save_series_td(series, "output/pipe_series_network",
+                   reservoir_radius=res_radius)
+
+    visualize_pipes(
+        series_rings,
+        title="Smooth Pipe Series with Hex-Hole Reservoir",
+        save_path="output/pipe_series_visualization.png",
+        reservoir_holes=[(pipe_end_s, pipe_radius_s,
+                          last_frames_s[-1], t_end_s, res_radius)],
+    )
+
     plt.show()
