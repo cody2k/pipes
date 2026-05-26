@@ -1,14 +1,3 @@
-# dbt artifacts & unnecessary folders
-target/
-dbt_packages/
-logs/
-base_queries/
-docs/
-.claude/
-*.htm
-*.html
-
-# Python virtual environment
 .venv/
 __pycache__/
 *.pyc
