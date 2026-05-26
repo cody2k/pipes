@@ -698,6 +698,72 @@ def _sphere_hole_to_rows(
     return pts_rows, prims_rows, verts_rows
 
 
+def _series_to_rows(
+        segments:         List[Tuple[List[np.ndarray],
+                                     List[Tuple[np.ndarray, np.ndarray]]]],
+        reservoir_radius: float | None = None,
+        reservoir_n_lat:  int           = 20,
+        reservoir_inset:  float         = 0.0125,
+        pt_off:           int           = 0,
+        pr_off:           int           = 0,
+        vt_off:           int           = 0,
+) -> Tuple[List[dict], List[dict], List[dict], int, int, int]:
+    """
+    Build points / primitives / vertices rows for one pipe series.
+
+    Accepts carry-in offsets and returns carry-out offsets so multiple
+    independent series can be concatenated with globally unique indices.
+
+    Returns
+    -------
+    (pts, prims, verts, next_pt_off, next_pr_off, next_vt_off)
+    """
+    all_pts:   List[dict] = []
+    all_prims: List[dict] = []
+    all_verts: List[dict] = []
+    n_sides = len(segments[0][0][0])
+
+    for seg_idx, (rings, frames) in enumerate(segments):
+        if seg_idx == 0:
+            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
+            all_pts.extend(pts)
+            all_verts.extend(verts)
+            pt_off += len(rings) * n_sides
+            vt_off += len(rings) * n_sides
+        else:
+            pt_off -= n_sides
+            vt_off -= n_sides
+            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
+            all_pts.extend(pts[n_sides:])
+            all_verts.extend(verts[n_sides:])
+            pt_off += len(rings) * n_sides
+            vt_off += len(rings) * n_sides
+
+        all_prims.extend(prims)
+        pr_off += (len(rings) - 1) * n_sides
+
+    if reservoir_radius is not None:
+        last_rings, last_frames = segments[-1]
+        pipe_end    = last_rings[-1].mean(axis=0)
+        pipe_radius = float(np.linalg.norm(last_rings[-1][0] - pipe_end))
+        t_end = last_rings[-1].mean(0) - last_rings[-2].mean(0)
+        t_end /= np.linalg.norm(t_end)
+
+        pts, prims, verts = _sphere_hole_to_rows(
+            pipe_end, pipe_radius, last_frames[-1], t_end,
+            reservoir_radius, reservoir_n_lat, n_sides, reservoir_inset,
+            pt_off, pr_off, vt_off,
+        )
+        all_pts.extend(pts)
+        all_prims.extend(prims)
+        all_verts.extend(verts)
+        pt_off += len(pts)
+        pr_off += len(prims)
+        vt_off += len(verts)
+
+    return all_pts, all_prims, all_verts, pt_off, pr_off, vt_off
+
+
 def save_series_td(
         segments:         List[Tuple[List[np.ndarray],
                                      List[Tuple[np.ndarray, np.ndarray]]]],
@@ -721,43 +787,62 @@ def save_series_td(
                        (default 20; n_lon is derived from the pipe's n_sides)
     reservoir_inset  : how far the sphere overlaps into the pipe (default 0.0125)
     """
+    pts, prims, verts, _, _, _ = _series_to_rows(
+        segments, reservoir_radius, reservoir_n_lat, reservoir_inset
+    )
+    pd.DataFrame(pts).to_csv(  basename + '_points.csv',     index=False)
+    pd.DataFrame(prims).to_csv(basename + '_primitives.csv', index=False)
+    pd.DataFrame(verts).to_csv(basename + '_vertices.csv',   index=False)
+    suffix = " + reservoir" if reservoir_radius is not None else ""
+    print(f"  {len(segments)} seg(s){suffix}: {len(pts)} pts / "
+          f"{len(prims)} prims / {len(verts)} verts -> {basename}_*.csv")
+
+
+def save_multi_series_td(
+        systems:         List[dict],
+        basename:        str,
+        reservoir_n_lat: int   = 20,
+        reservoir_inset: float = 0.0125,
+) -> None:
+    """
+    Save joined TD POP CSVs for multiple independent pipe systems in one export.
+
+    All systems share a single set of three CSVs with globally unique point /
+    vertex / primitive indices, so TouchDesigner imports them as one POP geometry.
+
+    Parameters
+    ----------
+    systems          : list of dicts, one per independent pipe system.
+                       Required key:
+                         'segments'         – list of (rings, frames) tuples from
+                                              generate_pipe_series()
+                       Optional keys (fall back to function-level defaults):
+                         'reservoir_radius' – float or None  (default None)
+                         'reservoir_n_lat'  – int             (default reservoir_n_lat)
+                         'reservoir_inset'  – float           (default reservoir_inset)
+    basename         : output path prefix (e.g. 'output/dual_pipes')
+    reservoir_n_lat  : default latitude bands for reservoirs across all systems
+    reservoir_inset  : default reservoir inset depth across all systems
+
+    Writes
+    ------
+    {basename}_points.csv
+    {basename}_primitives.csv
+    {basename}_vertices.csv
+    """
     all_pts:   List[dict] = []
     all_prims: List[dict] = []
     all_verts: List[dict] = []
     pt_off = pr_off = vt_off = 0
-    n_sides = len(segments[0][0][0])   # sides derived from first ring
 
-    for seg_idx, (rings, frames) in enumerate(segments):
-        if seg_idx == 0:
-            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
-            all_pts.extend(pts)
-            all_verts.extend(verts)
-            pt_off += len(rings) * n_sides
-            vt_off += len(rings) * n_sides
-        else:
-            # Junction ring == last ring of previous segment; reuse its indices
-            pt_off -= n_sides
-            vt_off -= n_sides
-            pts, prims, verts = _pipe_to_rows(rings, frames, pt_off, pr_off, vt_off)
-            all_pts.extend(pts[n_sides:])      # skip first ring (already exported)
-            all_verts.extend(verts[n_sides:])  # skip first ring's vertices (same)
-            pt_off += len(rings) * n_sides     # net advance: (n-1)*n_sides
-            vt_off += len(rings) * n_sides
+    for system in systems:
+        segs    = system['segments']
+        res_r   = system.get('reservoir_radius', None)
+        res_lat = system.get('reservoir_n_lat',  reservoir_n_lat)
+        res_ins = system.get('reservoir_inset',  reservoir_inset)
 
-        all_prims.extend(prims)
-        pr_off += (len(rings) - 1) * n_sides
-
-    if reservoir_radius is not None:
-        last_rings, last_frames = segments[-1]
-        pipe_end    = last_rings[-1].mean(axis=0)
-        pipe_radius = float(np.linalg.norm(last_rings[-1][0] - pipe_end))
-        t_end = last_rings[-1].mean(0) - last_rings[-2].mean(0)
-        t_end /= np.linalg.norm(t_end)
-
-        pts, prims, verts = _sphere_hole_to_rows(
-            pipe_end, pipe_radius, last_frames[-1], t_end,
-            reservoir_radius, reservoir_n_lat, n_sides, reservoir_inset,
-            pt_off, pr_off, vt_off,
+        pts, prims, verts, pt_off, pr_off, vt_off = _series_to_rows(
+            segs, res_r, res_lat, res_ins, pt_off, pr_off, vt_off
         )
         all_pts.extend(pts)
         all_prims.extend(prims)
@@ -766,8 +851,10 @@ def save_series_td(
     pd.DataFrame(all_pts).to_csv(  basename + '_points.csv',     index=False)
     pd.DataFrame(all_prims).to_csv(basename + '_primitives.csv', index=False)
     pd.DataFrame(all_verts).to_csv(basename + '_vertices.csv',   index=False)
-    suffix = " + reservoir" if reservoir_radius is not None else ""
-    print(f"  {len(segments)} seg(s){suffix}: {len(all_pts)} pts / "
+    n_sys   = len(systems)
+    has_res = sum(1 for s in systems if s.get('reservoir_radius') is not None)
+    suffix  = f" ({has_res} reservoir(s))" if has_res else ""
+    print(f"  {n_sys} system(s){suffix}: {len(all_pts)} pts / "
           f"{len(all_prims)} prims / {len(all_verts)} verts -> {basename}_*.csv")
 
 
@@ -1060,6 +1147,27 @@ def example_pipe_series():
     )
 
 
+def example_two_vertical_pipes():
+    """
+    Two straight vertical pipes, each with a hex-hole reservoir at the base.
+
+    Pipe A: top (-2, 2, 0) → base (-2, -1, 0), reservoir at base
+    Pipe B: top ( 2, 2, 0) → base ( 2, -1, 0), reservoir at base
+
+    Pipes are defined top-to-bottom so the reservoir attaches at the end
+    (y = -1).  Both pipes share identical radius and ring density.
+    """
+    pipe_a = generate_pipe_series(
+        segment_waypoints=[[(-2, 2, 0), (-2, -1, 0)]],
+        radius=0.25, rings_per_length=20, tension=0.5,
+    )
+    pipe_b = generate_pipe_series(
+        segment_waypoints=[[(2, 2, 0), (2, -1, 0)]],
+        radius=0.25, rings_per_length=20, tension=0.5,
+    )
+    return pipe_a, pipe_b
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1116,6 +1224,43 @@ if __name__ == "__main__":
         save_path="output/pipe_series_visualization.png",
         reservoir_holes=[(pipe_end_s, pipe_radius_s,
                           last_frames_s[-1], t_end_s, res_radius, n_sides)],
+    )
+
+    # ── Two independent vertical pipes with reservoirs ────────────────────
+    print("\n--- Two vertical pipes (multi-system export) ---")
+    pipe_a, pipe_b = example_two_vertical_pipes()
+    dual_res_radius = 0.5
+
+    save_multi_series_td(
+        [
+            {'segments': pipe_a, 'reservoir_radius': dual_res_radius},
+            {'segments': pipe_b, 'reservoir_radius': dual_res_radius},
+        ],
+        'output/dual_vertical_pipes',
+    )
+
+    # Build reservoir_holes args for visualization
+    dual_holes = []
+    for series in [pipe_a, pipe_b]:
+        last_r, last_f = series[-1]
+        pe    = last_r[-1].mean(0)
+        p_rad = float(np.linalg.norm(last_r[-1][0] - pe))
+        t_e   = last_r[-1].mean(0) - last_r[-2].mean(0)
+        t_e  /= np.linalg.norm(t_e)
+        n_s   = len(series[0][0][0])
+        dual_holes.append((pe, p_rad, last_f[-1], t_e, dual_res_radius, n_s))
+
+    dual_rings = {}
+    for label, series in [('Pipe A', pipe_a), ('Pipe B', pipe_b)]:
+        for i, (rings, _) in enumerate(series):
+            key = label if len(series) == 1 else f"{label} Seg {i+1}"
+            dual_rings[key] = rings
+
+    visualize_pipes(
+        dual_rings,
+        title="Two Vertical Pipes with Reservoirs",
+        save_path="output/dual_vertical_pipes_visualization.png",
+        reservoir_holes=dual_holes,
     )
 
     plt.show()
