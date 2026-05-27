@@ -1147,6 +1147,56 @@ def example_pipe_series():
     )
 
 
+def example_spiral_reservoir():
+    """
+    Gentle swoop from (-3,2,0) to (3,1.5,0), then an inward 3-loop Archimedean
+    spiral (clockwise in the XY plane) converging to a hex-hole reservoir at
+    (0,-2,0).  All geometry lies in the Z=0 plane.
+
+    Phase 1 — swoop: soft arc across the scene defined by five shaping waypoints.
+
+    Phase 2 — spiral: Archimedean spiral centred at (0,-2,0).  Initial radius
+    ≈ 4.61 (distance from centre to (3,1.5,0)) shrinks linearly to zero over
+    exactly 3 clockwise loops.  90 waypoints define the spiral; the last lands
+    at the centre (0,-2,0) where the reservoir attaches.
+    """
+    # Phase 1: gentle swoop across
+    swoop = [
+        (-3.0, 2.0, 0.0),
+        (-1.5, 2.1, 0.0),
+        ( 0.0, 1.9, 0.0),
+        ( 1.5, 1.7, 0.0),
+        ( 3.0, 1.5, 0.0),
+    ]
+
+    # Phase 2: clockwise inward Archimedean spiral; centre = reservoir point
+    cx, cy      = 0.0, -2.0
+    n_sp        = 90
+    t_sp        = np.linspace(0.0, 1.0, n_sp + 1)[1:]    # (1/90 … 1]; skips duplicate at t=0
+
+    theta_start = np.arctan2(1.5 - cy, 3.0 - cx)         # ≈ 0.862 rad (NE of centre)
+    r_start     = np.hypot(3.0 - cx, 1.5 - cy)           # ≈ 4.609
+
+    theta = theta_start - 2.0 * np.pi * 3.0 * t_sp       # CW: 3 full loops
+    r     = r_start * (1.0 - t_sp)                        # linear shrink → 0
+
+    spiral_pts = list(zip(
+        (cx + r * np.cos(theta)).tolist(),
+        (cy + r * np.sin(theta)).tolist(),
+        np.zeros(n_sp).tolist(),
+    ))
+
+    # spiral_pts[-1] = (0, -2, 0) exactly (t=1 → r=0)
+    all_waypoints = swoop + spiral_pts
+
+    return generate_pipe_series(
+        segment_waypoints=[all_waypoints],
+        radius=0.2,
+        rings_per_length=20,
+        tension=0.0,
+    )
+
+
 def example_two_vertical_pipes():
     """
     Two straight vertical pipes, each with a hex-hole reservoir at the base.
@@ -1224,6 +1274,30 @@ if __name__ == "__main__":
         save_path="output/pipe_series_visualization.png",
         reservoir_holes=[(pipe_end_s, pipe_radius_s,
                           last_frames_s[-1], t_end_s, res_radius, n_sides)],
+    )
+
+    # ── Downward spiral with reservoir at top ────────────────────────────
+    print("\n--- Spiral with reservoir ---")
+    spiral_series = example_spiral_reservoir()
+    spiral_res_radius = 0.45
+
+    save_series_td(spiral_series, "output/spiral_reservoir",
+                   reservoir_radius=spiral_res_radius)
+
+    sp_last_rings, sp_last_frames = spiral_series[-1]
+    sp_pe    = sp_last_rings[-1].mean(0)
+    sp_prad  = float(np.linalg.norm(sp_last_rings[-1][0] - sp_pe))
+    sp_t_end = sp_last_rings[-1].mean(0) - sp_last_rings[-2].mean(0)
+    sp_t_end /= np.linalg.norm(sp_t_end)
+    sp_n     = len(spiral_series[0][0][0])
+
+    spiral_rings = {f"Spiral Seg {i+1}": s[0] for i, s in enumerate(spiral_series)}
+    visualize_pipes(
+        spiral_rings,
+        title="Swoop + Inward Archimedean Spiral with Hex-Hole Reservoir",
+        save_path="output/spiral_reservoir_visualization.png",
+        reservoir_holes=[(sp_pe, sp_prad, sp_last_frames[-1],
+                          sp_t_end, spiral_res_radius, sp_n)],
     )
 
     # ── Two independent vertical pipes with reservoirs ────────────────────
